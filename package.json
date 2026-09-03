@@ -1,0 +1,18 @@
+{
+  "name": "stark-wms",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/api",
+    "packages/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w packages/api",
+    "dev:web": "npm run dev -w packages/web",
+    "build:api": "npm run build -w packages/api",
+    "build:web": "npm run build -w packages/web",
+    "test:api": "npm test -w packages/api",
+    "prisma:migrate": "npm run prisma:migrate -w packages/api",
+    "prisma:seed": "npm run prisma:seed -w packages/api"
+  }
+}
