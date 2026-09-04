@@ -340,6 +340,7 @@ model Lot {
   allocations  Allocation[]
   countItems   InventoryCountItem[]
   qualityInspections QualityInspection[]
+  replenishmentTasks ReplenishmentTask[]
 
   @@unique([productId, code])
 }
@@ -360,7 +361,15 @@ model InventoryBalance {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  @@unique([productId, locationId, lotId])
+  // NOTE: uniqueness on (productId, locationId, lotId) is enforced at the DB
+  // level by an expression index (see migration
+  // 20260904000000_balance_coalesce_unique) using COALESCE(lotId, '') —
+  // Postgres treats NULL as distinct-from-NULL, so a plain Prisma @@unique
+  // here would NOT stop two concurrent first-writes for a non-lot-controlled
+  // product+location from creating duplicate balance rows. Do not add
+  // @@unique([productId, locationId, lotId]) back without also removing the
+  // expression index, or the two will conflict.
+  @@index([productId, locationId, lotId])
   @@index([productId])
   @@index([locationId])
 }
@@ -726,6 +735,8 @@ model ReplenishmentTask {
   id             String               @id @default(cuid())
   productId      String
   product        Product              @relation(fields: [productId], references: [id])
+  lotId          String?
+  lot            Lot?                 @relation(fields: [lotId], references: [id])
   fromLocationId String
   fromLocation   Location             @relation("ReplenishFrom", fields: [fromLocationId], references: [id])
   toLocationId   String

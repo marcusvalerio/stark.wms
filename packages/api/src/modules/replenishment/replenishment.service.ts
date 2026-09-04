@@ -32,12 +32,25 @@ export async function scanReplenishmentNeeds(actor: AuthUser) {
       });
       if (alreadyPending) continue;
 
-      const reserveBalance = await prisma.inventoryBalance.findFirst({
+      const product = await prisma.product.findUniqueOrThrow({ where: { id: productId }, select: { expiryControl: true } });
+      const reserveCandidates = await prisma.inventoryBalance.findMany({
         where: { productId, qtyAvailable: { gt: 0 }, location: { type: "RESERVE", status: "ACTIVE" } },
         include: { lot: true },
-        orderBy: { createdAt: "asc" },
       });
-      if (!reserveBalance) continue;
+      if (reserveCandidates.length === 0) continue;
+      // FEFO for expiry-controlled products (matches the Allocation
+      // Engine's rule — replenishment should not strand near-expiry stock
+      // in reserve while picking faces pull from newer lots), FIFO
+      // otherwise, mirroring allocation-engine.ts's ordering logic.
+      reserveCandidates.sort((a, b) => {
+        if (product.expiryControl) {
+          const ea = a.lot?.expiryDate?.getTime() ?? Infinity;
+          const eb = b.lot?.expiryDate?.getTime() ?? Infinity;
+          if (ea !== eb) return ea - eb;
+        }
+        return a.createdAt.getTime() - b.createdAt.getTime();
+      });
+      const reserveBalance = reserveCandidates[0];
 
       const target = location.pickingMax ?? location.pickingMin ?? currentQty;
       const desiredQty = Math.max(target - currentQty, 0);
@@ -46,7 +59,7 @@ export async function scanReplenishmentNeeds(actor: AuthUser) {
 
       const task = await prisma.$transaction(async (tx) => {
         const replenishment = await tx.replenishmentTask.create({
-          data: { productId, fromLocationId: reserveBalance.locationId, toLocationId: location.id, qty, status: "PENDING" },
+          data: { productId, lotId: reserveBalance.lotId, fromLocationId: reserveBalance.locationId, toLocationId: location.id, qty, status: "PENDING" },
         });
         await taskService.createTask(tx, {
           type: "REPLENISHMENT",
@@ -89,10 +102,22 @@ export async function execute(actor: AuthUser, id: string) {
     if (task.status === "CANCELLED") throw new ConflictError("Tarefa cancelada.");
     if (task.operatorId && task.operatorId !== actor.id) throw new ConflictError("Tarefa atribuída a outro operador.");
 
+    // Claim the task atomically before touching inventory: two operators
+    // racing to execute the same ReplenishmentTask must not both succeed in
+    // transferring stock (source has enough for two transfers of the same
+    // qty, so the inventory-engine guard alone won't catch a duplicate
+    // execution — this row-level compare-and-swap is what prevents it).
+    const claimed = await tx.replenishmentTask.updateMany({
+      where: { id, status: task.status, operatorId: task.operatorId },
+      data: { status: "COMPLETED", operatorId: actor.id, completedAt: new Date() },
+    });
+    if (claimed.count === 0) throw new ConflictError("Tarefa foi executada por outra operação nesse meio tempo.");
+
     await engine.transferStock(tx, {
       type: "REPLENISH",
       productId: task.productId,
       qty: task.qty,
+      lotId: task.lotId,
       fromLocationId: task.fromLocationId,
       toLocationId: task.toLocationId,
       userId: actor.id,
@@ -100,12 +125,12 @@ export async function execute(actor: AuthUser, id: string) {
       refId: id,
     });
 
-    const updated = await tx.replenishmentTask.update({ where: { id }, data: { status: "COMPLETED", operatorId: actor.id, completedAt: new Date() } });
+    const updated = await tx.replenishmentTask.findUniqueOrThrow({ where: { id } });
 
     const genericTask = await tx.task.findFirst({ where: { refType: "ReplenishmentTask", refId: id, status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS"] } } });
     if (genericTask) {
-      if (genericTask.status === "PENDING") {
-        await tx.task.update({ where: { id: genericTask.id }, data: { status: "IN_PROGRESS", assignedToId: actor.id, startedAt: new Date() } });
+      if (genericTask.status !== "IN_PROGRESS") {
+        await taskService.startTaskTx(tx, genericTask.id, actor.id);
       }
       await taskService.completeTaskTx(tx, genericTask.id);
     }
@@ -120,7 +145,12 @@ export async function cancel(actor: AuthUser, id: string) {
     const task = await tx.replenishmentTask.findUnique({ where: { id } });
     if (!task) throw new NotFoundError("Tarefa de reabastecimento", id);
     if (["COMPLETED", "CANCELLED"].includes(task.status)) throw new ValidationError("Tarefa já finalizada.");
-    const updated = await tx.replenishmentTask.update({ where: { id }, data: { status: "CANCELLED" } });
+    // Guarded: if an execute() call raced ahead and already completed this
+    // task (moving real stock), a plain unconditional update here would
+    // stomp COMPLETED back to CANCELLED even though the transfer happened.
+    const result = await tx.replenishmentTask.updateMany({ where: { id, status: task.status }, data: { status: "CANCELLED" } });
+    if (result.count === 0) throw new ConflictError("Tarefa foi alterada por outra operação nesse meio tempo.");
+    const updated = await tx.replenishmentTask.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "CANCEL", entityType: "ReplenishmentTask", entityId: id, newValue: { status: "CANCELLED" } });
     return updated;
   });

@@ -1,7 +1,7 @@
 import { CountStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -87,7 +87,8 @@ async function transition(actor: AuthUser, id: string, to: CountStatus) {
     const count = await tx.inventoryCount.findUnique({ where: { id } });
     if (!count) throw new NotFoundError("Inventário", id);
     countStateMachine.assertCanTransition(count.status, to);
-    const updated = await tx.inventoryCount.update({ where: { id }, data: { status: to, closedAt: to === "COMPLETED" || to === "CANCELLED" ? new Date() : undefined } });
+    await guardedTransition(tx.inventoryCount, id, count.status, { status: to, closedAt: to === "COMPLETED" || to === "CANCELLED" ? new Date() : undefined });
+    const updated = await tx.inventoryCount.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: `TRANSITION_${to}`, entityType: "InventoryCount", entityId: id, previousValue: { status: count.status }, newValue: { status: to } });
     return updated;
   });
@@ -125,11 +126,15 @@ export async function completeCounting(actor: AuthUser, id: string) {
     const uncounted = count.items.filter((i) => i.countedQty1 === null);
     if (uncounted.length > 0) throw new ValidationError(`Existem ${uncounted.length} item(ns) ainda não contado(s).`);
 
-    await tx.inventoryCount.update({ where: { id }, data: { status: "REVIEW" } });
+    // Guarded first: two concurrent "concluir contagem" calls must not both
+    // pass the checks above and both raise a full duplicate set of
+    // Discrepancy records for the same divergent items below.
+    await guardedTransition(tx.inventoryCount, id, count.status, { status: "REVIEW" });
 
     const divergent = count.items.filter((i) => i.countedQty1 !== i.systemQty);
     if (divergent.length === 0) {
-      const updated = await tx.inventoryCount.update({ where: { id }, data: { status: "APPROVAL" } });
+      await tx.inventoryCount.update({ where: { id }, data: { status: "APPROVAL" } });
+      const updated = await tx.inventoryCount.findUniqueOrThrow({ where: { id } });
       await writeAudit(tx, actor, { action: "REVIEW_NO_DIVERGENCE", entityType: "InventoryCount", entityId: id, newValue: { status: "APPROVAL" } });
       return updated;
     }
@@ -161,7 +166,8 @@ export async function completeRecount(actor: AuthUser, id: string) {
     countStateMachine.assertCanTransition(count.status, "APPROVAL");
     const missing = count.items.filter((i) => i.status === "DIVERGENT" && i.countedQty2 === null);
     if (missing.length > 0) throw new ValidationError(`Existem ${missing.length} item(ns) divergente(s) sem segunda contagem.`);
-    const updated = await tx.inventoryCount.update({ where: { id }, data: { status: "APPROVAL" } });
+    await guardedTransition(tx.inventoryCount, id, count.status, { status: "APPROVAL" });
+    const updated = await tx.inventoryCount.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "COMPLETE_RECOUNT", entityType: "InventoryCount", entityId: id, newValue: { status: "APPROVAL" } });
     return updated;
   });
@@ -173,11 +179,16 @@ export async function approve(actor: AuthUser, id: string) {
     const count = await tx.inventoryCount.findUnique({ where: { id }, include: { items: true } });
     if (!count) throw new NotFoundError("Inventário", id);
     countStateMachine.assertCanTransition(count.status, "ADJUSTMENT");
+    // Guarded first: prevents two concurrent "aprovar" calls from both
+    // writing finalQty on every item (harmless if identical, but also
+    // pointless double work) and, more importantly, establishes that only
+    // one approve() ever hands this count off to applyAdjustments.
+    await guardedTransition(tx.inventoryCount, id, count.status, { status: "ADJUSTMENT" });
     for (const item of count.items) {
       const finalQty = item.countedQty2 ?? item.countedQty1 ?? item.systemQty;
       await tx.inventoryCountItem.update({ where: { id: item.id }, data: { finalQty, status: "APPROVED" } });
     }
-    const updated = await tx.inventoryCount.update({ where: { id }, data: { status: "ADJUSTMENT" } });
+    const updated = await tx.inventoryCount.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "APPROVE", entityType: "InventoryCount", entityId: id, newValue: { status: "ADJUSTMENT" } });
     return updated;
   });
@@ -189,6 +200,11 @@ export async function applyAdjustments(actor: AuthUser, id: string) {
     const count = await tx.inventoryCount.findUnique({ where: { id }, include: { items: true } });
     if (!count) throw new NotFoundError("Inventário", id);
     countStateMachine.assertCanTransition(count.status, "COMPLETED");
+    // Guarded first (and directly to the terminal COMPLETED status): each
+    // engine.applyCountAdjustment call below posts a real InventoryBalance
+    // delta — two concurrent calls without this claim would each walk the
+    // same items and apply the same corrections twice.
+    await guardedTransition(tx.inventoryCount, id, count.status, { status: "COMPLETED", closedAt: new Date() });
 
     let adjustedCount = 0;
     for (const item of count.items) {
@@ -212,11 +228,11 @@ export async function applyAdjustments(actor: AuthUser, id: string) {
 
     const tasks = await tx.task.findMany({ where: { refType: "InventoryCount", refId: id, status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS"] } } });
     for (const t of tasks) {
-      if (t.status === "PENDING") await tx.task.update({ where: { id: t.id }, data: { status: "IN_PROGRESS", startedAt: new Date() } });
+      if (t.status !== "IN_PROGRESS") await taskService.startTaskTx(tx, t.id, actor.id);
       await taskService.completeTaskTx(tx, t.id);
     }
 
-    const updated = await tx.inventoryCount.update({ where: { id }, data: { status: "COMPLETED", closedAt: new Date() } });
+    const updated = await tx.inventoryCount.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "APPLY_ADJUSTMENTS", entityType: "InventoryCount", entityId: id, newValue: { adjustedCount } });
     return updated;
   });

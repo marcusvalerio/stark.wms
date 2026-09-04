@@ -65,6 +65,29 @@ Login de demonstração (senha `stark@123`): `admin@starkwms.com`,
 
 Coletor mobile: `/mobile` (mesmo login, layout dedicado a operador).
 
+## Testes
+
+```bash
+npm run test:api    # 78 testes (vitest) contra o Postgres real
+```
+
+Cobertura: máquinas de estado, motor de prioridade de tarefas,
+**concorrência real** (`Promise.all` disparando requisições
+verdadeiramente simultâneas contra reserva de estoque, início de tarefa,
+liberação de pedido e picking — não apenas o caso sequencial),
+autorização por perfil via HTTP (`supertest`, não só leitura de código), e
+um teste de aceitação que percorre o ciclo operacional completo —
+fornecedor → recebimento → conferência → divergência → resolução →
+put-away → estoque → pedido → reserva → alocação → onda → picking →
+reabastecimento → conferência → packing → staging → doca → carregamento →
+expedição → baixa → auditoria — com asserção de banco após cada etapa.
+
+Ver [`docs/AUDIT.md`](docs/AUDIT.md) para o relatório completo da
+auditoria adversarial da Fase 3: cada achado crítico (condições de corrida
+no motor de estoque e no motor de tarefas que permitiam sobrevenda,
+alocação duplicada e conclusão dupla de tarefas) foi reproduzido por um
+teste antes de ser corrigido.
+
 ## Metodologia
 
 O sistema foi construído em fases (arquitetura → cadastros → armazém/estoque

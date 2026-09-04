@@ -1,7 +1,7 @@
 import { ReceiptStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { ConflictError, NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -76,7 +76,8 @@ async function transition(actor: AuthUser, id: string, to: ReceiptStatus, extra:
     const receipt = await tx.receipt.findUnique({ where: { id } });
     if (!receipt) throw new NotFoundError("Recebimento", id);
     receiptStateMachine.assertCanTransition(receipt.status, to);
-    const updated = await tx.receipt.update({ where: { id }, data: { status: to, ...extra } });
+    await guardedTransition(tx.receipt, id, receipt.status, { status: to, ...extra });
+    const updated = await tx.receipt.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: `TRANSITION_${to}`, entityType: "Receipt", entityId: id, previousValue: { status: receipt.status }, newValue: { status: to } });
     return updated;
   });
@@ -93,7 +94,8 @@ export async function startConference(actor: AuthUser, id: string) {
     const receipt = await tx.receipt.findUnique({ where: { id } });
     if (!receipt) throw new NotFoundError("Recebimento", id);
     receiptStateMachine.assertCanTransition(receipt.status, "IN_CONFERENCE");
-    const updated = await tx.receipt.update({ where: { id }, data: { status: "IN_CONFERENCE", operatorId: actor.id } });
+    await guardedTransition(tx.receipt, id, receipt.status, { status: "IN_CONFERENCE", operatorId: actor.id });
+    const updated = await tx.receipt.findUniqueOrThrow({ where: { id } });
     await taskService.createTask(tx, {
       type: "CONFERENCE",
       priority: "NORMAL",
@@ -121,6 +123,13 @@ export async function checkItem(actor: AuthUser, receiptId: string, itemId: stri
     }
     const item = await tx.receiptItem.findUnique({ where: { id: itemId }, include: { product: true } });
     if (!item || item.receiptId !== receiptId) throw new NotFoundError("Item de recebimento", itemId);
+    if (item.status !== "PENDING") {
+      // Without this, a double-click or a retried request would silently
+      // raise a second Discrepancy for the same item on every resubmission
+      // instead of being rejected — section 10's "never silently corrected"
+      // cuts both ways: it also means never silently re-processed.
+      throw new ConflictError(`Item já conferido (status atual: ${item.status}).`);
+    }
 
     let lotId: string | undefined;
     if (item.product.lotControl) {
@@ -142,8 +151,12 @@ export async function checkItem(actor: AuthUser, receiptId: string, itemId: stri
     }
 
     const hasDivergence = data.receivedQty !== item.expectedQty || data.damagedQty > 0;
-    const updated = await tx.receiptItem.update({
-      where: { id: itemId },
+    // CAS on status: "PENDING" — closes the true-concurrency version of the
+    // double-submit race the guard above only catches sequentially (two
+    // requests both reading PENDING before either commits would otherwise
+    // both pass that check and both raise a discrepancy).
+    const guarded = await tx.receiptItem.updateMany({
+      where: { id: itemId, status: "PENDING" },
       data: {
         receivedQty: data.receivedQty,
         damagedQty: data.damagedQty,
@@ -151,6 +164,8 @@ export async function checkItem(actor: AuthUser, receiptId: string, itemId: stri
         status: hasDivergence ? "DIVERGENT" : "CHECKED",
       },
     });
+    if (guarded.count === 0) throw new ConflictError("Item já foi conferido por outra operação nesse meio tempo.");
+    const updated = await tx.receiptItem.findUniqueOrThrow({ where: { id: itemId } });
 
     if (data.receivedQty !== item.expectedQty) {
       await raiseDiscrepancy(tx, {
@@ -199,12 +214,15 @@ export async function completeConference(actor: AuthUser, id: string) {
     const pending = receipt.items.filter((i) => i.status === "PENDING");
     if (pending.length > 0) throw new ValidationError(`Existem ${pending.length} item(ns) ainda não conferido(s).`);
 
-    const updated = await tx.receipt.update({ where: { id }, data: { status: "CONFERRED" } });
+    // Guarded: without this, two concurrent "concluir conferência" calls
+    // (e.g. a double-click) would both pass the checks above and both go on
+    // to generate a full duplicate set of PUTAWAY tasks below.
+    await guardedTransition(tx.receipt, id, receipt.status, { status: "CONFERRED" });
 
     const conferenceTask = await tx.task.findFirst({ where: { refType: "Receipt", refId: id, type: "CONFERENCE", status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS"] } } });
     if (conferenceTask) {
-      if (conferenceTask.status === "PENDING") {
-        await tx.task.update({ where: { id: conferenceTask.id }, data: { assignedToId: actor.id, startedAt: new Date(), status: "IN_PROGRESS" } });
+      if (conferenceTask.status !== "IN_PROGRESS") {
+        await taskService.startTaskTx(tx, conferenceTask.id, actor.id);
       }
       await taskService.completeTaskTx(tx, conferenceTask.id);
     }
@@ -223,6 +241,7 @@ export async function completeConference(actor: AuthUser, id: string) {
     }
 
     await tx.receipt.update({ where: { id }, data: { status: "PUTAWAY" } });
+    const updated = await tx.receipt.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "COMPLETE_CONFERENCE", entityType: "Receipt", entityId: id, newValue: { putawayTasks: goodItems.length } });
     return updated;
   });
@@ -238,9 +257,17 @@ export async function executePutaway(actor: AuthUser, taskId: string, destLocati
     if (task.status === "CANCELLED") throw new ConflictError("Tarefa cancelada.");
     if (task.assignedToId && task.assignedToId !== actor.id) throw new ConflictError("Tarefa atribuída a outro operador.");
 
-    if (task.status === "PENDING") {
-      taskService.taskStateMachine.assertCanTransition(task.status, "IN_PROGRESS");
-      await tx.task.update({ where: { id: taskId }, data: { status: "IN_PROGRESS", assignedToId: actor.id, startedAt: new Date() } });
+    if (task.status !== "IN_PROGRESS") {
+      // Covers both PENDING (nobody claimed it yet) and ASSIGNED (a
+      // supervisor pre-assigned it via /tasks/:id/assign) — the task state
+      // machine only allows IN_PROGRESS -> COMPLETED, so skipping this step
+      // whenever status was ASSIGNED (as an earlier version of this
+      // function did, checking `=== "PENDING"` only) would leave the task
+      // stuck ASSIGNED and make completeTaskTx below reject the transition
+      // outright. Guarded compare-and-swap, not a plain unconditional
+      // update: two operators racing to execute the same put-away task must
+      // not both proceed to double-add the received stock to InventoryBalance.
+      await taskService.startTaskTx(tx, taskId, actor.id);
     }
 
     const item = await tx.receiptItem.findUniqueOrThrow({ where: { id: task.refId } });

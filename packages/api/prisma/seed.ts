@@ -278,13 +278,25 @@ async function main() {
     }
   }
 
-  const reserveLocations = [];
+  const reserveLocations: Awaited<ReturnType<typeof ensureLocation>>[] = [];
   for (const aisle of ["01", "02", "03"]) {
     for (const rk of ["01", "02", "03", "04"]) {
       for (const level of ["01", "02", "03"]) {
         reserveLocations.push(await ensureLocation(zoneB.id, "B", aisle, rk, level, "01", "RESERVE", { capacityQty: 500, maxWeightKg: 1500, maxVolumeM3: 8 }));
       }
     }
+  }
+
+  async function pickReserveLocationWithCapacity(qty: number) {
+    const candidates = await prisma.location.findMany({
+      where: { id: { in: reserveLocations.map((l) => l.id) } },
+      select: { id: true, capacityQty: true, occupiedQty: true },
+    });
+    const withRoom = candidates.filter((l) => l.capacityQty - l.occupiedQty >= qty);
+    if (withRoom.length === 0) {
+      throw new Error(`Seed: nenhuma localização de reserva com capacidade para ${qty} unidade(s).`);
+    }
+    return pick(withRoom);
   }
 
   const receivingLocations = [];
@@ -380,7 +392,14 @@ async function main() {
 
     const openTasks = await prisma.task.findMany({ where: { receiptId: receipt.id, type: "PUTAWAY", status: "PENDING" } });
     for (const task of openTasks) {
-      const dest = pick(reserveLocations);
+      // Mirrors what a real operator using the Rules Engine's suggestion
+      // would do: pick a destination that actually has room for this qty,
+      // not a uniformly random one — increaseAvailable() now enforces
+      // capacity for real (section 3.6/scenario 9 of the audit), so a
+      // location already near-full from earlier put-aways in this same
+      // seed run must be skipped, exactly like a real conflicting
+      // concurrent put-away would be.
+      const dest = await pickReserveLocationWithCapacity(task.qty ?? 1);
       const operator = pick(operators);
       await receivingService.executePutaway(operator, task.id, dest.id);
     }

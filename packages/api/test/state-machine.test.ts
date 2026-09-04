@@ -17,8 +17,13 @@ describe("StateMachine", () => {
     expect(() => sm.assertCanTransition("B", "A")).toThrow(InvalidStateTransitionError);
   });
 
-  it("treats a same-state transition as a no-op", () => {
+  it("rejects a same-state transition unless explicitly listed (audit P1-1: re-completing an already-completed task must not silently succeed)", () => {
     const sm = new StateMachine<"A" | "B">("Test", { A: [], B: [] });
+    expect(() => sm.assertCanTransition("A", "A")).toThrow(InvalidStateTransitionError);
+  });
+
+  it("allows a self-loop only when the map explicitly lists it", () => {
+    const sm = new StateMachine<"A" | "B">("Test", { A: ["A", "B"], B: [] });
     expect(() => sm.assertCanTransition("A", "A")).not.toThrow();
   });
 });

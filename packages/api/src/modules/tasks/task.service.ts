@@ -104,42 +104,74 @@ export async function assignTask(actor: AuthUser, taskId: string, userId: string
     const user = await tx.user.findUnique({ where: { id: userId } });
     if (!user || user.status !== "ACTIVE") throw new NotFoundError("Operador", userId);
 
-    const updated = await tx.task.update({ where: { id: taskId }, data: { status: "ASSIGNED", assignedToId: userId } });
+    // Compare-and-swap on the exact status we just validated: if another
+    // request mutated this task between our read and this write, the WHERE
+    // no longer matches and we lose the race cleanly instead of silently
+    // overwriting whatever the winner did.
+    const result = await tx.task.updateMany({
+      where: { id: taskId, status: task.status },
+      data: { status: "ASSIGNED", assignedToId: userId },
+    });
+    if (result.count === 0) throw new ConflictError("Tarefa foi alterada por outra operação; recarregue e tente novamente.");
     await tx.taskAssignment.create({ data: { taskId, userId } });
     await writeAudit(tx, actor, { action: "ASSIGN", entityType: "Task", entityId: taskId, previousValue: { assignedToId: task.assignedToId }, newValue: { assignedToId: userId } });
-    return updated;
+    return tx.task.findUniqueOrThrow({ where: { id: taskId } });
   });
 }
 
-export async function startTask(actor: AuthUser, taskId: string, userId: string) {
-  return prisma.$transaction(async (tx) => {
-    // Row lock semantics: SELECT ... FOR UPDATE would be ideal on a raw
-    // query; Prisma's transaction + status re-check below prevents two
-    // operators from both starting the same PENDING/ASSIGNED task.
-    const task = await tx.task.findUnique({ where: { id: taskId } });
-    if (!task) throw new NotFoundError("Tarefa", taskId);
-    if (task.status === "IN_PROGRESS") {
-      throw new ConflictError("Tarefa já está em andamento.");
-    }
-    if (task.assignedToId && task.assignedToId !== userId) {
-      throw new ConflictError("Tarefa já atribuída a outro operador.");
-    }
-    taskStateMachine.assertCanTransition(task.status, "IN_PROGRESS");
+// Section 20/39 + audit 3.4: two operators must never both succeed in
+// starting the same task. The guard below is a compare-and-swap on BOTH the
+// status and assignedToId we just read: two concurrent callers can both
+// pass the JS-level checks (assignedToId null, status PENDING), but only
+// one `updateMany` WHERE clause will still match once Postgres serializes
+// the two writes via the row lock — the loser gets count=0 and a
+// ConflictError instead of silently reassigning the task out from under
+// the winner.
+//
+// This is a `tx`-scoped helper (not just a thin wrapper called from
+// `startTask` below) specifically so domain flows that bump a task to
+// IN_PROGRESS as one step inside their own larger transaction (put-away
+// execution, replenishment execution) can reuse the *guarded* version
+// instead of re-implementing an unconditional `task.update` inline — an
+// earlier version of this codebase did exactly that in receiving.service's
+// executePutaway, which silently reopened the same race this guard exists
+// to close (see docs/AUDIT.md).
+export async function startTaskTx(tx: Tx, taskId: string, userId: string, actor?: AuthUser) {
+  const task = await tx.task.findUnique({ where: { id: taskId } });
+  if (!task) throw new NotFoundError("Tarefa", taskId);
+  if (task.status === "IN_PROGRESS" && task.assignedToId !== userId) {
+    throw new ConflictError("Tarefa já está em andamento com outro operador.");
+  }
+  if (task.assignedToId && task.assignedToId !== userId) {
+    throw new ConflictError("Tarefa já atribuída a outro operador.");
+  }
+  taskStateMachine.assertCanTransition(task.status, "IN_PROGRESS");
 
-    const updated = await tx.task.update({
-      where: { id: taskId },
-      data: { status: "IN_PROGRESS", assignedToId: userId, startedAt: new Date() },
-    });
-    await writeAudit(tx, actor, { action: "START", entityType: "Task", entityId: taskId, previousValue: { status: task.status }, newValue: { status: "IN_PROGRESS" } });
-    return updated;
+  const result = await tx.task.updateMany({
+    where: { id: taskId, status: task.status, assignedToId: task.assignedToId },
+    data: { status: "IN_PROGRESS", assignedToId: userId, startedAt: task.startedAt ?? new Date() },
   });
+  if (result.count === 0) throw new ConflictError("Tarefa já foi iniciada por outro operador.");
+  if (actor) {
+    await writeAudit(tx, actor, { action: "START", entityType: "Task", entityId: taskId, previousValue: { status: task.status }, newValue: { status: "IN_PROGRESS" } });
+  }
+  return tx.task.findUniqueOrThrow({ where: { id: taskId } });
+}
+
+export async function startTask(actor: AuthUser, taskId: string, userId: string) {
+  return prisma.$transaction((tx) => startTaskTx(tx, taskId, userId, actor));
 }
 
 export async function completeTaskTx(tx: Tx, taskId: string) {
   const task = await tx.task.findUnique({ where: { id: taskId } });
   if (!task) throw new NotFoundError("Tarefa", taskId);
   taskStateMachine.assertCanTransition(task.status, "COMPLETED");
-  return tx.task.update({ where: { id: taskId }, data: { status: "COMPLETED", completedAt: new Date() } });
+  const result = await tx.task.updateMany({
+    where: { id: taskId, status: task.status },
+    data: { status: "COMPLETED", completedAt: new Date() },
+  });
+  if (result.count === 0) throw new ConflictError("Tarefa foi concluída ou alterada por outra operação.");
+  return tx.task.findUniqueOrThrow({ where: { id: taskId } });
 }
 
 export async function completeTask(actor: AuthUser, taskId: string) {
@@ -155,9 +187,13 @@ export async function cancelTask(actor: AuthUser, taskId: string, reason: string
     const task = await tx.task.findUnique({ where: { id: taskId } });
     if (!task) throw new NotFoundError("Tarefa", taskId);
     taskStateMachine.assertCanTransition(task.status, "CANCELLED");
-    const updated = await tx.task.update({ where: { id: taskId }, data: { status: "CANCELLED", cancelReason: reason } });
+    const result = await tx.task.updateMany({
+      where: { id: taskId, status: task.status },
+      data: { status: "CANCELLED", cancelReason: reason },
+    });
+    if (result.count === 0) throw new ConflictError("Tarefa foi alterada por outra operação; recarregue e tente novamente.");
     await writeAudit(tx, actor, { action: "CANCEL", entityType: "Task", entityId: taskId, previousValue: { status: task.status }, newValue: { status: "CANCELLED", reason } });
-    return updated;
+    return tx.task.findUniqueOrThrow({ where: { id: taskId } });
   });
 }
 

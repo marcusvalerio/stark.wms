@@ -1,7 +1,7 @@
 import { ShipmentStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { ConflictError, NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { z } from "zod";
@@ -67,7 +67,8 @@ export async function assignDock(actor: AuthUser, id: string, dockId: string) {
     const shipment = await tx.shipment.findUnique({ where: { id } });
     if (!shipment) throw new NotFoundError("Expedição", id);
     shipmentStateMachine.assertCanTransition(shipment.status, "DOCK");
-    const updated = await tx.shipment.update({ where: { id }, data: { status: "DOCK", dockId } });
+    await guardedTransition(tx.shipment, id, shipment.status, { status: "DOCK", dockId });
+    const updated = await tx.shipment.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "ASSIGN_DOCK", entityType: "Shipment", entityId: id, newValue: { dockId } });
     return updated;
   });
@@ -78,11 +79,12 @@ export async function load(actor: AuthUser, id: string) {
     const shipment = await tx.shipment.findUnique({ where: { id } });
     if (!shipment) throw new NotFoundError("Expedição", id);
     shipmentStateMachine.assertCanTransition(shipment.status, "LOADING");
-    const updated = await tx.shipment.update({ where: { id }, data: { status: "LOADING", loadedAt: new Date() } });
+    await guardedTransition(tx.shipment, id, shipment.status, { status: "LOADING", loadedAt: new Date() });
+    const updated = await tx.shipment.findUniqueOrThrow({ where: { id } });
 
     const order = await tx.order.findUniqueOrThrow({ where: { id: shipment.orderId } });
     orderStateMachine.assertCanTransition(order.status, "READY");
-    await tx.order.update({ where: { id: order.id }, data: { status: "READY" } });
+    await guardedTransition(tx.order, order.id, order.status, { status: "READY" });
 
     await writeAudit(tx, actor, { action: "LOAD", entityType: "Shipment", entityId: id, newValue: { status: "LOADING" } });
     return updated;
@@ -98,7 +100,9 @@ export async function ship(actor: AuthUser, id: string) {
       throw new ConflictError("Pedido precisa estar PRONTO (carregado na doca) antes de expedir.");
     }
 
-    const updated = await tx.shipment.update({ where: { id }, data: { status: "SHIPPED", shippedAt: new Date() } });
+    // Guarded first: two concurrent "expedir" calls must not both proceed
+    // to double-write qtyShipped and create duplicate SHIP movements below.
+    await guardedTransition(tx.shipment, id, shipment.status, { status: "SHIPPED", shippedAt: new Date() });
 
     for (const item of shipment.order.items) {
       await tx.orderItem.update({ where: { id: item.id }, data: { qtyShipped: item.qtyPicked } });
@@ -119,6 +123,7 @@ export async function ship(actor: AuthUser, id: string) {
     orderStateMachine.assertCanTransition(shipment.order.status, "SHIPPED");
     await tx.order.update({ where: { id: shipment.order.id }, data: { status: "SHIPPED" } });
 
+    const updated = await tx.shipment.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "SHIP", entityType: "Shipment", entityId: id, newValue: { status: "SHIPPED", romaneioNumber: shipment.romaneioNumber } });
     return updated;
   });

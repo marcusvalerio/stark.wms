@@ -1,6 +1,6 @@
 import { prisma } from "@/db/prisma";
 import { ConflictError, NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { PackageStatus } from "@prisma/client";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
@@ -26,7 +26,7 @@ export async function createPackage(actor: AuthUser, data: z.infer<typeof create
     if (!order) throw new NotFoundError("Pedido", data.orderId);
     if (order.status === "CONFERENCE") {
       orderStateMachine.assertCanTransition(order.status, "PACKING");
-      await tx.order.update({ where: { id: order.id }, data: { status: "PACKING" } });
+      await guardedTransition(tx.order, order.id, order.status, { status: "PACKING" });
     } else if (order.status !== "PACKING") {
       throw new ValidationError("Pedido precisa estar em CONFERÊNCIA ou PACKING para criar volumes.");
     }
@@ -63,7 +63,8 @@ export async function closePackage(actor: AuthUser, packageId: string, data: z.i
     packageStateMachine.assertCanTransition(pkg.status, "CLOSED");
     if (pkg.items.length === 0) throw new ValidationError("Volume não possui itens.");
 
-    const updated = await tx.package.update({ where: { id: packageId }, data: { ...data, status: "CLOSED", closedAt: new Date() } });
+    await guardedTransition(tx.package, packageId, pkg.status, { ...data, status: "CLOSED", closedAt: new Date() });
+    const updated = await tx.package.findUniqueOrThrow({ where: { id: packageId } });
     await writeAudit(tx, actor, { action: "CLOSE", entityType: "Package", entityId: packageId, newValue: data });
     return updated;
   });
@@ -88,7 +89,8 @@ export async function sendToStaging(actor: AuthUser, orderId: string) {
       }
     }
 
-    const updated = await tx.order.update({ where: { id: orderId }, data: { status: "STAGING" } });
+    await guardedTransition(tx.order, orderId, order.status, { status: "STAGING" });
+    const updated = await tx.order.findUniqueOrThrow({ where: { id: orderId } });
     await writeAudit(tx, actor, { action: "SEND_TO_STAGING", entityType: "Order", entityId: orderId, newValue: { status: "STAGING" } });
     return updated;
   });

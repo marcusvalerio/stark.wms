@@ -1,7 +1,7 @@
 import { QualityStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { NotFoundError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -62,7 +62,8 @@ export async function startInspection(actor: AuthUser, id: string) {
     const inspection = await tx.qualityInspection.findUnique({ where: { id } });
     if (!inspection) throw new NotFoundError("Inspeção", id);
     qualityStateMachine.assertCanTransition(inspection.status, "INSPECTING");
-    const updated = await tx.qualityInspection.update({ where: { id }, data: { status: "INSPECTING", inspectorId: actor.id } });
+    await guardedTransition(tx.qualityInspection, id, inspection.status, { status: "INSPECTING", inspectorId: actor.id });
+    const updated = await tx.qualityInspection.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "START", entityType: "QualityInspection", entityId: id, newValue: { status: "INSPECTING" } });
     return updated;
   });
@@ -74,6 +75,14 @@ export async function decide(actor: AuthUser, id: string, data: z.infer<typeof d
     if (!inspection) throw new NotFoundError("Inspeção", id);
     qualityStateMachine.assertCanTransition(inspection.status, data.result);
     if (!inspection.locationId || !inspection.qty) throw new NotFoundError("Localização/quantidade da inspeção", id);
+
+    // Guarded first, with the real final state: two concurrent decide()
+    // calls (e.g. APPROVED and REJECTED submitted moments apart) must not
+    // both proceed to release the same quarantined qty back into
+    // circulation.
+    await guardedTransition(tx.qualityInspection, id, inspection.status, {
+      status: data.result, result: data.result, notes: data.notes, decidedAt: new Date(), inspectorId: inspection.inspectorId ?? actor.id,
+    });
 
     await engine.releaseFromQuarantine(tx, {
       type: "RELEASE",
@@ -92,10 +101,7 @@ export async function decide(actor: AuthUser, id: string, data: z.infer<typeof d
       await tx.lot.update({ where: { id: inspection.lotId }, data: { status: data.result === "APPROVED" ? "ACTIVE" : "BLOCKED" } });
     }
 
-    const updated = await tx.qualityInspection.update({
-      where: { id },
-      data: { status: data.result, result: data.result, notes: data.notes, decidedAt: new Date(), inspectorId: inspection.inspectorId ?? actor.id },
-    });
+    const updated = await tx.qualityInspection.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "DECIDE", entityType: "QualityInspection", entityId: id, newValue: { result: data.result } });
     return updated;
   });

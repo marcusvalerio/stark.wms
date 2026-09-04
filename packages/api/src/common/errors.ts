@@ -50,3 +50,15 @@ export class InsufficientStockError extends AppError {
     super(message, 409, "INSUFFICIENT_STOCK");
   }
 }
+
+export class LocationCapacityError extends AppError {
+  constructor(message = "Endereço não possui capacidade suficiente.") {
+    super(message, 409, "LOCATION_CAPACITY_EXCEEDED");
+  }
+}
+
+export class IncompatibleLocationError extends AppError {
+  constructor(message = "Endereço incompatível com o produto.") {
+    super(message, 409, "INCOMPATIBLE_LOCATION");
+  }
+}

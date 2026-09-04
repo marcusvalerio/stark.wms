@@ -1,7 +1,7 @@
 import { OrderStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { ConflictError, NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -80,7 +80,15 @@ export async function release(actor: AuthUser, id: string) {
     const order = await tx.order.findUnique({ where: { id } });
     if (!order) throw new NotFoundError("Pedido", id);
     orderStateMachine.assertCanTransition(order.status, "RELEASED");
-    await tx.order.update({ where: { id }, data: { status: "RELEASED" } });
+    // Guarded: without this, two concurrent "liberar pedido" calls both read
+    // RECEIVED, both pass the check, and both call allocateOrder — since
+    // allocateOrderItem computes remainingNeeded from qtyAllocated read at
+    // the start of EACH transaction, both would see 0 and each reserve the
+    // full ordered quantity, doubling qtyAllocated against a single order
+    // (real stock genuinely reserved twice, just against the wrong order
+    // arithmetic). This CAS ensures only one release() ever reaches
+    // allocateOrder for a given RECEIVED order.
+    await guardedTransition(tx.order, id, order.status, { status: "RELEASED" });
 
     const { totalBackorder } = await allocateOrder(tx, id);
 
@@ -98,11 +106,14 @@ export async function startPicking(actor: AuthUser, id: string) {
     const order = await tx.order.findUnique({ where: { id } });
     if (!order) throw new NotFoundError("Pedido", id);
     orderStateMachine.assertCanTransition(order.status, "PICKING");
+    // Guarded first: prevents two concurrent calls from both generating a
+    // full duplicate set of picking tasks for the same allocations.
+    await guardedTransition(tx.order, id, order.status, { status: "PICKING" });
 
     const tasks = await generatePickingTasks(tx, id);
     if (tasks.length === 0) throw new ValidationError("Nenhuma alocação pendente para gerar tarefas de separação.");
 
-    const updated = await tx.order.update({ where: { id }, data: { status: "PICKING" } });
+    const updated = await tx.order.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "START_PICKING", entityType: "Order", entityId: id, newValue: { tasksGenerated: tasks.length } });
     return updated;
   });
@@ -117,7 +128,8 @@ export async function advanceToConference(actor: AuthUser, id: string) {
     const incomplete = order.items.some((i) => i.qtyPicked < i.qtyAllocated);
     if (incomplete) throw new ValidationError("Pedido não pode ser conferido: existem itens ainda não separados.");
 
-    const updated = await tx.order.update({ where: { id }, data: { status: "CONFERENCE" } });
+    await guardedTransition(tx.order, id, order.status, { status: "CONFERENCE" });
+    const updated = await tx.order.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "ADVANCE_CONFERENCE", entityType: "Order", entityId: id, newValue: { status: "CONFERENCE" } });
     return updated;
   });
@@ -128,6 +140,13 @@ export async function cancel(actor: AuthUser, id: string, reason: string) {
     const order = await tx.order.findUnique({ where: { id }, include: { items: { include: { reservations: true } } } });
     if (!order) throw new NotFoundError("Pedido", id);
     orderStateMachine.assertCanTransition(order.status, "CANCELLED");
+    // Guarded first: an order that's already SHIPPED (or was just cancelled
+    // by a concurrent request) must never be pushed to CANCELLED out from
+    // under a second, unrelated transition — scenario 3.13 #13 "cancelar
+    // pedido já expedido" is exactly this without the guard, since SHIPPED
+    // isn't a valid "from" state in the machine but a stale JS read of an
+    // order that was RECEIVED a moment ago wouldn't know that.
+    await guardedTransition(tx.order, id, order.status, { status: "CANCELLED", notes: reason });
 
     for (const item of order.items) {
       for (const reservation of item.reservations) {
@@ -139,7 +158,7 @@ export async function cancel(actor: AuthUser, id: string, reason: string) {
     await tx.allocation.updateMany({ where: { orderItem: { orderId: id }, status: "PENDING" }, data: { status: "CANCELLED" } });
     await tx.pickingTask.updateMany({ where: { orderItem: { orderId: id }, status: { in: ["PENDING", "ASSIGNED"] } }, data: { status: "CANCELLED" } });
 
-    const updated = await tx.order.update({ where: { id }, data: { status: "CANCELLED", notes: reason } });
+    const updated = await tx.order.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "CANCEL", entityType: "Order", entityId: id, previousValue: { status: order.status }, newValue: { status: "CANCELLED", reason } });
     return updated;
   });

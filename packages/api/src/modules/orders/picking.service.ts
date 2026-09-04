@@ -51,21 +51,37 @@ export async function executePickingTask(actor: AuthUser, pickingTaskId: string,
       throw new ValidationError(`Quantidade superior ao saldo sugerido para esta tarefa (restam ${remainingOnTask}).`);
     }
 
+    // Audit 3.4/3.13 (concluir picking duas vezes / dois operadores na mesma
+    // tarefa): the qty bump and the "won't overshoot qtySuggested" check
+    // must be one atomic statement, not read-then-write — otherwise two
+    // concurrent partial picks that each individually look valid against a
+    // stale qtyPicked snapshot can together exceed qtySuggested, and
+    // whichever commits last silently overwrites the other's contribution
+    // (a classic lost update). Postgres serializes the two updateMany calls
+    // on this row; the second one's WHERE re-evaluates against the
+    // already-incremented value and correctly reports the conflict.
+    const guardedIncrement = await tx.pickingTask.updateMany({
+      where: { id: pickingTaskId, status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS"] }, qtyPicked: { lte: pickingTask.qtySuggested - qtyPicked } },
+      data: { qtyPicked: { increment: qtyPicked }, operatorId: actor.id, status: "IN_PROGRESS" },
+    });
+    if (guardedIncrement.count === 0) {
+      throw new ConflictError("Tarefa foi alterada por outra operação (quantidade ou status) nesse meio tempo; recarregue e tente novamente.");
+    }
+
     const reservation = await tx.inventoryReservation.findFirst({
       where: { orderItemId: pickingTask.orderItemId, locationId: pickingTask.locationId, lotId: pickingTask.lotId, status: "ACTIVE" },
     });
-    if (!reservation || reservation.qty < qtyPicked) {
+    if (!reservation) {
       throw new ValidationError("Reserva de estoque insuficiente para concluir a separação.");
     }
 
     await engine.consumeReservation(tx, { reservationId: reservation.id, qty: qtyPicked, userId: actor.id, refType: "PickingTask", refId: pickingTask.id });
 
-    const newQtyPicked = pickingTask.qtyPicked + qtyPicked;
-    const taskDone = newQtyPicked >= pickingTask.qtySuggested;
-    await tx.pickingTask.update({
-      where: { id: pickingTaskId },
-      data: { qtyPicked: newQtyPicked, operatorId: actor.id, status: taskDone ? "COMPLETED" : "IN_PROGRESS", completedAt: taskDone ? new Date() : undefined },
-    });
+    const refreshedTask = await tx.pickingTask.findUniqueOrThrow({ where: { id: pickingTaskId } });
+    const taskDone = refreshedTask.qtyPicked >= refreshedTask.qtySuggested;
+    if (taskDone) {
+      await tx.pickingTask.updateMany({ where: { id: pickingTaskId, status: { not: "COMPLETED" } }, data: { status: "COMPLETED", completedAt: new Date() } });
+    }
 
     const genericTask = await tx.task.findFirst({ where: { refType: "PickingTask", refId: pickingTaskId, status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS"] } } });
     if (genericTask) {

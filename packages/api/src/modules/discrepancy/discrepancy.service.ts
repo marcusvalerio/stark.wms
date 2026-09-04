@@ -1,7 +1,7 @@
 import { DiscrepancyStatus, DiscrepancyType, Prisma, PrismaClient } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { NotFoundError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -64,7 +64,8 @@ export async function review(actor: AuthUser, id: string) {
     const discrepancy = await tx.discrepancy.findUnique({ where: { id } });
     if (!discrepancy) throw new NotFoundError("Divergência", id);
     discrepancyStateMachine.assertCanTransition(discrepancy.status, "IN_REVIEW");
-    const updated = await tx.discrepancy.update({ where: { id }, data: { status: "IN_REVIEW" } });
+    await guardedTransition(tx.discrepancy, id, discrepancy.status, { status: "IN_REVIEW" });
+    const updated = await tx.discrepancy.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "REVIEW", entityType: "Discrepancy", entityId: id, previousValue: { status: discrepancy.status }, newValue: { status: "IN_REVIEW" } });
     return updated;
   });
@@ -75,10 +76,10 @@ export async function resolve(actor: AuthUser, id: string, input: { action: stri
     const discrepancy = await tx.discrepancy.findUnique({ where: { id } });
     if (!discrepancy) throw new NotFoundError("Divergência", id);
     discrepancyStateMachine.assertCanTransition(discrepancy.status, "RESOLVED");
-    const updated = await tx.discrepancy.update({
-      where: { id },
-      data: { status: "RESOLVED", resolvedById: actor.id, resolvedAt: new Date(), resolutionAction: input.action, resolutionNotes: input.notes },
+    await guardedTransition(tx.discrepancy, id, discrepancy.status, {
+      status: "RESOLVED", resolvedById: actor.id, resolvedAt: new Date(), resolutionAction: input.action, resolutionNotes: input.notes,
     });
+    const updated = await tx.discrepancy.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, {
       action: "RESOLVE",
       entityType: "Discrepancy",
@@ -95,10 +96,8 @@ export async function cancel(actor: AuthUser, id: string, reason: string) {
     const discrepancy = await tx.discrepancy.findUnique({ where: { id } });
     if (!discrepancy) throw new NotFoundError("Divergência", id);
     discrepancyStateMachine.assertCanTransition(discrepancy.status, "CANCELLED");
-    const updated = await tx.discrepancy.update({
-      where: { id },
-      data: { status: "CANCELLED", resolvedById: actor.id, resolvedAt: new Date(), resolutionNotes: reason },
-    });
+    await guardedTransition(tx.discrepancy, id, discrepancy.status, { status: "CANCELLED", resolvedById: actor.id, resolvedAt: new Date(), resolutionNotes: reason });
+    const updated = await tx.discrepancy.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "CANCEL", entityType: "Discrepancy", entityId: id, previousValue: { status: discrepancy.status }, newValue: { status: "CANCELLED", reason } });
     return updated;
   });

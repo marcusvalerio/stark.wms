@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient } from "@prisma/client";
+import { InsufficientStockError } from "@/common/errors";
 import * as engine from "@/modules/inventory/inventory.engine";
 import * as taskService from "@/modules/tasks/task.service";
 
@@ -36,19 +37,30 @@ export async function allocateOrderItem(tx: Tx, orderItemId: string) {
   balances.sort((a, b) => (a.location.type === b.location.type ? 0 : a.location.type === "PICKING" ? -1 : 1));
 
   let remaining = remainingNeeded;
-  let sequence = 0;
   for (const balance of balances) {
     if (remaining <= 0) break;
     const take = Math.min(remaining, balance.qtyAvailable);
     if (take <= 0) continue;
 
-    await engine.reserveStock(tx, {
-      productId: orderItem.productId,
-      locationId: balance.locationId,
-      lotId: balance.lotId,
-      qty: take,
-      orderItemId,
-    });
+    try {
+      await engine.reserveStock(tx, {
+        productId: orderItem.productId,
+        locationId: balance.locationId,
+        lotId: balance.lotId,
+        qty: take,
+        orderItemId,
+      });
+    } catch (err) {
+      // The candidate list above is a snapshot; a concurrent release() on
+      // another order (or a concurrent transfer/block) can shrink this
+      // exact balance's availability between that read and this reserve
+      // attempt. reserveStock's atomic guard (correctly) rejects it rather
+      // than over-reserving — section 16 says that shortfall becomes a
+      // backorder, not a failed order release, so we move on to the next
+      // candidate instead of letting the error abort the whole order.
+      if (err instanceof InsufficientStockError) continue;
+      throw err;
+    }
 
     await tx.allocation.create({
       data: {
@@ -62,7 +74,6 @@ export async function allocateOrderItem(tx: Tx, orderItemId: string) {
     });
 
     remaining -= take;
-    sequence += 1;
   }
 
   const allocated = remainingNeeded - remaining;

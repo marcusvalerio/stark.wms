@@ -1,7 +1,7 @@
 import { WaveStatus } from "@prisma/client";
 import { prisma } from "@/db/prisma";
 import { NotFoundError, ValidationError } from "@/common/errors";
-import { StateMachine } from "@/common/state-machine";
+import { StateMachine, guardedTransition } from "@/common/state-machine";
 import { AuthUser } from "@/common/auth-middleware";
 import { writeAudit } from "@/common/audit";
 import { PaginationQuery, paginatedResult, toSkipTake } from "@/common/pagination";
@@ -61,6 +61,10 @@ export async function release(actor: AuthUser, id: string) {
     const wave = await tx.pickWave.findUnique({ where: { id }, include: { orders: true } });
     if (!wave) throw new NotFoundError("Onda", id);
     waveStateMachine.assertCanTransition(wave.status, "RELEASED");
+    // Guarded first: two concurrent "liberar onda" calls must not both
+    // reach the loop below and each generate a full duplicate set of
+    // picking tasks for the same orders.
+    await guardedTransition(tx.pickWave, id, wave.status, { status: "RELEASED", releasedAt: new Date() });
 
     let totalTasks = 0;
     for (const link of wave.orders) {
@@ -72,7 +76,7 @@ export async function release(actor: AuthUser, id: string) {
       await tx.order.update({ where: { id: order.id }, data: { status: "PICKING" } });
     }
 
-    const updated = await tx.pickWave.update({ where: { id }, data: { status: "RELEASED", releasedAt: new Date() } });
+    const updated = await tx.pickWave.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "RELEASE", entityType: "PickWave", entityId: id, newValue: { tasksGenerated: totalTasks } });
     return updated;
   });
@@ -83,7 +87,8 @@ async function transition(actor: AuthUser, id: string, to: WaveStatus, extra: Re
     const wave = await tx.pickWave.findUnique({ where: { id } });
     if (!wave) throw new NotFoundError("Onda", id);
     waveStateMachine.assertCanTransition(wave.status, to);
-    const updated = await tx.pickWave.update({ where: { id }, data: { status: to, ...extra } });
+    await guardedTransition(tx.pickWave, id, wave.status, { status: to, ...extra });
+    const updated = await tx.pickWave.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: `TRANSITION_${to}`, entityType: "PickWave", entityId: id, previousValue: { status: wave.status }, newValue: { status: to } });
     return updated;
   });
@@ -97,9 +102,10 @@ export async function cancel(actor: AuthUser, id: string) {
     const wave = await tx.pickWave.findUnique({ where: { id } });
     if (!wave) throw new NotFoundError("Onda", id);
     waveStateMachine.assertCanTransition(wave.status, "CANCELLED");
+    await guardedTransition(tx.pickWave, id, wave.status, { status: "CANCELLED" });
     await tx.pickingTask.updateMany({ where: { waveId: id, status: { in: ["PENDING", "ASSIGNED"] } }, data: { status: "CANCELLED" } });
     await tx.task.updateMany({ where: { refType: "PickingTask", refId: { in: (await tx.pickingTask.findMany({ where: { waveId: id }, select: { id: true } })).map((t) => t.id) }, status: { in: ["PENDING", "ASSIGNED"] } }, data: { status: "CANCELLED", cancelReason: "Onda cancelada" } });
-    const updated = await tx.pickWave.update({ where: { id }, data: { status: "CANCELLED" } });
+    const updated = await tx.pickWave.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "CANCEL", entityType: "PickWave", entityId: id, newValue: { status: "CANCELLED" } });
     return updated;
   });
@@ -112,7 +118,8 @@ export async function complete(actor: AuthUser, id: string) {
     waveStateMachine.assertCanTransition(wave.status, "COMPLETED");
     const pending = wave.pickingTasks.filter((t) => !["COMPLETED", "CANCELLED"].includes(t.status));
     if (pending.length > 0) throw new ValidationError(`Ainda existem ${pending.length} tarefa(s) de separação pendente(s) nesta onda.`);
-    const updated = await tx.pickWave.update({ where: { id }, data: { status: "COMPLETED", completedAt: new Date() } });
+    await guardedTransition(tx.pickWave, id, wave.status, { status: "COMPLETED", completedAt: new Date() });
+    const updated = await tx.pickWave.findUniqueOrThrow({ where: { id } });
     await writeAudit(tx, actor, { action: "COMPLETE", entityType: "PickWave", entityId: id, newValue: { status: "COMPLETED" } });
     return updated;
   });
